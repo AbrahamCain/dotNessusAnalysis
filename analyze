@@ -1,0 +1,220 @@
+#!/usr/bin/python3
+# This script should provide analysis of .Nessus files to include:
+"""
+    - Number of Hosts
+    - For each Host:
+        :D  -- Credentialed Checks?
+        :D  -- Thorough Checks?
+        -- Plugin debugging?
+        :D  -- Paranoia?
+        :D  -- Superseded Patches?
+        -- Launched Plugin List (Plugin 112154)
+        :D  -- Credential Problem Plugins Present?
+        -- Errors in Nessusd.dump?
+        -- Intermittent Auth issues?
+        -- Rate Limiting Detected?
+        -- 
+    - KB File Diff
+    :D - Scan Policy Options
+    :D - Settings Diff
+
+
+
+It would be cool to be able to get items specifically by feeding in an XML path like:
+    - "preferences/ServerPreferences/silent_dependencies"
+UPDATE: This can be done with: 
+    - <soupObject>.select("preferences > ServerPreferences > silent_dependencies") 
+
+"""
+#Requires that you pip install "bs4" and "lxml"
+from bs4 import BeautifulSoup as bs
+import argparse
+
+
+## WHEN TO USE: Use once in the main loop to initialize the arg scanner to handle cmdline args
+def handleArgs():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-f1", "--file1", help = "A .Nessus file to analyze")
+    parser.add_argument("-f2", "--file2", help = "A .Nessus file to compare against file 1")
+    parser.add_argument("-h1", "--host", help = "A host to filter the results on (defaults to the first host if unspecified)")
+    parser.add_argument("-v", "--verbose", help = "Show more output", action='store_true')
+    parser.add_argument("-aP", "--analyzePlugins", help = "Diff the plugins", action='store_true')
+    parser.add_argument("-aS", "--analyzeSettings", help = "Diff the Settings", action='store_true')
+    args = parser.parse_args()
+    return args
+
+
+## WHEN TO USE: Use whenever you only want something printed if the verbose arg is supplied
+def debugPrint(msg):
+    if args.verbose:
+        print(msg) 
+
+
+## WHEN TO USE: Use once for each file passed in to initialize a Beautiful Soup object to search
+#IN: <.Nessus file name>
+#OUT: <Beautiful Soup Object>
+def getSoupObject(filename):
+    with open(filename, "r") as f:
+        data = f.read()
+    soupObject = bs(data, "xml")
+    return soupObject
+    
+
+## WHEN TO USE: 
+#IN: <soupObject>
+#OUT: <List of serverPreference names>
+def getPrefNames (soup, prefType):
+    allPrefs = []
+    if prefType == "ServerPreferences":
+        labels=[]
+        for i in soup.find_all("preference"):
+            label = str(i.find('name').text + " = " + i.find('name').value)
+            labels.append(label)
+    
+
+    
+
+## WHEN TO USE: Parse settings from "Policy > Preferences > PluginsPreferences"
+#IN: <soup object>, <setting to get the value of>
+#OUT: <string value of the setting>
+def getPluginsPref(soup, selected):
+    selectedPreference = soup.find(string=selected).parent.find_next_siblings()[-1]
+    return selectedPreference.text
+
+
+## WHEN TO USE: Parse tags from "Report > ReportHost > HostProperties > tag"
+#IN: <soup object>, <name value for ReportHost>, <name value for tag>
+#OUT: Tag Value
+def getHostTag(soup, host, tagName):
+    if host!="first":
+        if (reportHost := soup.find("ReportHost", attrs={"name": host})):
+            try:
+                tag = reportHost.find("tag", attrs={"name": tagName}).text
+            except:
+                tag = None
+        else:
+            tag = None
+    else:
+        tag = soup.find("ReportHost").find(
+            "tag", attrs={"name": "Credentialed_Scan"}
+            ).text
+    return tag
+
+
+## WHEN TO USE: when 
+#IN: <soup object>, <host argument from argparse if present>
+#OUT: <List of strings in the format "label = value">
+def buildReport(soup, host="first"):
+    Settings = {
+        "thorough":"Thorough tests (slow)", 
+        "cgi":"Enable CGI scanning", 
+        "paranoid":"Report paranoia",
+        "supersedence":"Display the superseded patches in the report",
+        "fragilePrinter":"Scan Network Printers",
+        "fragileNetware":"Scan Novell Netware hosts",
+        "fragileOT":"Scan Operational Technology devices",
+        "SSL Mode":"ssl_mode",
+        "# of Failed Creds":"hostCredsFailedCount"
+    }
+    Tags = {
+        "credentialed":"Credentialed_Scan",
+        "auth protocol":"local-checks-proto",
+        "usernameSSH":"ssh-login-used",
+        "usernameSMB":"smb-login-used",
+        "shell":"ssh_default_shell",
+        "osConfidence":"operating-system-conf"
+    }
+    report=[]
+    for label in Settings:
+        value = getPluginsPref(soup, Settings[label])
+        report.append((str(label)+" = "+value))
+    for label in Tags:
+        value = getHostTag(soup, host, Tags[label])
+        if value:
+            report.append((str(label)+" = "+value))
+        else:
+            report.append((str(label)+" = "+"NOT SET"))
+    return report
+
+
+## WHEN TO USE: when 2 files are provided
+#IN: <args object from argparser>
+#OUT: <diff report of the hosts printed to the STDOUT>
+def reportDiff(args):
+    file1 = args.file1
+    file2 = args.file2
+    soup1 = getSoupObject(file1)
+    soup2 = getSoupObject(file2)
+    if args.host:
+        host = args.host
+        reportHost1 = soup1.find("ReportHost", attrs={"name": host})
+        report1 = buildReport(soup1, host)
+        reportHost2 = soup2.find("ReportHost", attrs={"name": host})
+        report2 = buildReport(soup2, host)
+    else:
+        report1 = buildReport(soup1)
+        report2 = buildReport(soup2)
+    #
+    debugPrint(str("=")*80)
+    debugPrint("Host used as a filter for File1 = "+(host1:=str(soup1.find("ReportHost")['name'])))
+    debugPrint("Host used as a filter for File2 = "+(host2:=str(soup2.find("ReportHost")['name'])))
+    # Check to see if selected host is present in both scans (if specified)
+    if args.host and host1!=host2:
+        print("\n=========== Host not present in one of the scans ===========")    
+    # Check to see if reports are the same or different
+    elif report1 == report2:
+        print("\nReports are the same")
+    # If aren't the same and any host filter applied is showing up in both 
+    #   reports (or we don't care about the host filter), show the differences 
+    #   between the reports
+    else:
+        print("\n=========== Reports are different. Report diff line-by-line below ===========")
+        debugPrint("report1 Length = "+str(len(report1)))
+        debugPrint("report2 Length = "+str(len(report2)))
+        debugPrint("report1 = "+str((report1)))
+        debugPrint("report2 = "+str((report2)))
+
+        for i in range(len(report1)):
+            if report1[i] != report2[i]:
+                print("\nFile1 -> ",report1[i],"\nFile2 -> ",report2[i],"\n")
+            else:
+                debugPrint("\nFile1 -> "+report1[i]+"\nFile2 -> "+report2[i]+"\n")
+
+
+## WHEN TO USE: when 1 file is provided
+#IN: <args object from argparser>
+#OUT: <report on a single host printed to the STDOUT>
+def singleHostReport(args):
+    file1 = args.file1
+    soup1 = getSoupObject(file1)
+    if args.host:
+        host = args.host
+        report1 = buildReport(soup1, host)
+        reportHost = soup.find("ReportHost", attrs={"name": host})
+    else:
+        report1 = buildReport(soup1)
+        reportHost = str(soup1.find("ReportHost")['name'])
+    
+    # Start Analysis
+    debugPrint(str("=")*80)
+    debugPrint("Host used as a filter for File1 = "+reportHost)
+    # Check to see if selected host is present in both scans (if specified)
+    if args.host and reportHost:
+        print("\n=========== Host not present in one of the scans ===========")    
+    else:
+        print("\n=========== Reports are different. Report diff line-by-line below ===========")
+        debugPrint("report1 Length = "+str(len(report1)))
+        debugPrint("report1 = "+str((report1)))
+
+        for i in range(len(report1)):
+            print("\n",report1[i])
+
+
+### MAIN SECTION
+args = handleArgs()
+if args.file1 and args.file2:
+    reportDiff(args)
+    print("\n")
+elif args.file1 and args.analyzeSettings and (not args.file2):
+    singleHostReport(args)
+    print("\n")
